@@ -1,27 +1,15 @@
 import express from "express";
 import axios from "axios";
-import cors from "cors";
 import fs from "fs";
 import path from "path";
+import cors from "cors";
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// ------------- CONFIG -------------
-const CACHE_TTL = 24 * 60 * 60 * 1000; // 24h cache
-const DEFAULT_REFERER = "https://megaplay.buzz/";
-const BASE_OUTPUT_DIR = path.join(process.cwd(), "stream_cache"); // Save M3U8 files
-const PROXY_PREFIX = "/watch-Beta/stream/proxy.php?url=";
-const CURL_TIMEOUT = 15000;
-// ----------------------------------
-
-// Enable CORS for all origins
 app.use(cors({ origin: "*" }));
 
-// Ensure base output directory exists
-if (!fs.existsSync(BASE_OUTPUT_DIR)) fs.mkdirSync(BASE_OUTPUT_DIR, { recursive: true });
-
-// Helper: convert relative URL to absolute
+// --- Helpers ---
 function absUrl(base, relative) {
   try {
     return new URL(relative, base).toString();
@@ -30,157 +18,113 @@ function absUrl(base, relative) {
   }
 }
 
-// Helper: fetch remote content
-async function fetchText(url, referer) {
+async function fetchText(url, headers) {
   try {
-    const res = await axios.get(url, {
-      timeout: CURL_TIMEOUT,
-      responseType: "text",
-      headers: {
-        Accept: "*/*",
-        "Accept-Encoding": "gzip, deflate, br, zstd",
-        "Accept-Language": "en-US,en;q=0.9",
-        Origin: referer,
-        Referer: referer,
-        "User-Agent": "Mozilla/5.0 FastNodeProxy/1.0",
-      },
-    });
+    const res = await axios.get(url, { headers, timeout: 15000, responseType: "text" });
     return res.data;
   } catch {
     return null;
   }
 }
 
-// Simple in-memory index to track cache
-const cacheIndex = new Map();
-
-// --------------------- ROUTE: get_best_stream ---------------------
+// --- Route ---
 app.get("/get_best_stream", async (req, res) => {
-  const masterUrl = req.query.url;
+  const masterUrl = req.query.url ? decodeURIComponent(req.query.url) : null;
   if (!masterUrl) return res.json({ error: "Missing URL" });
 
-  let referer = req.query.referer || DEFAULT_REFERER;
+  let referer = req.query.referer ? decodeURIComponent(req.query.referer) : "https://megaplay.buzz/";
   try {
     const r = new URL(referer);
     referer = `${r.protocol}//${r.hostname}/`;
   } catch {
-    referer = DEFAULT_REFERER;
+    referer = "https://megaplay.buzz/";
   }
 
-  // Safe folder name based on SHA1 of URL + referer
-  const crypto = await import("crypto");
-  const hash = crypto.createHash("sha1").update(masterUrl + "|" + referer).digest("hex");
-  const cacheDir = path.join(BASE_OUTPUT_DIR, hash);
+  const headers = {
+    Accept: "*/*",
+    "Accept-Encoding": "gzip, deflate, br, zstd",
+    "Accept-Language": "en-US,en;q=0.9",
+    Connection: "keep-alive",
+    Origin: referer,
+    Referer: referer,
+    "User-Agent": "Mozilla/5.0"
+  };
 
-  if (!fs.existsSync(cacheDir)) fs.mkdirSync(cacheDir, { recursive: true });
+  // 1) Load master playlist
+  const playlist = await fetchText(masterUrl, headers);
+  if (!playlist) return res.json({ error: "Could not load master playlist" });
 
-  const masterCachePath = path.join(cacheDir, "master.m3u8");
+  const baseMasterUrl = path.dirname(masterUrl);
 
-  // Check long cache
-  if (fs.existsSync(masterCachePath) && Date.now() - fs.statSync(masterCachePath).mtimeMs < CACHE_TTL) {
-    const files = fs.readdirSync(cacheDir);
-    const variants = files
-      .filter((f) => f !== "." && f !== ".." && f !== "master.m3u8")
-      .map((f) => {
-        const bw = parseInt(path.parse(f).name, 10) || null;
-        return { bandwidth: bw, resolution: null, file: path.join("stream_cache", hash, f) };
-      });
-
-    return res.json({
-      master: path.join("stream_cache", hash, "master.m3u8"),
-      all: variants,
-    });
-  }
-
-  // Load master playlist
-  const masterTxt = await fetchText(masterUrl, referer);
-  if (!masterTxt) return res.json({ error: "Could not load master playlist" });
-
-  const lines = masterTxt.split(/\r?\n/);
-  let streams = [];
-
+  // 2) Parse playlist
+  const lines = playlist.split(/\r?\n/);
+  const streams = [];
   for (let i = 0; i < lines.length; i++) {
-    let line = lines[i].trim();
-    if (line.startsWith("#EXT-X-STREAM-INF")) {
-      const attrsText = line.replace("#EXT-X-STREAM-INF:", "");
-      let bandwidth = null;
-      let resolution = null;
+    const line = lines[i];
+    if (!line.includes("#EXT-X-STREAM-INF")) continue;
 
-      for (let part of attrsText.split(",")) {
-        part = part.trim();
-        if (part.startsWith("BANDWIDTH=")) bandwidth = parseInt(part.replace("BANDWIDTH=", ""), 10);
-        if (part.startsWith("RESOLUTION=")) resolution = part.replace("RESOLUTION=", "");
-      }
-
-      let j = i + 1;
-      while (j < lines.length && !lines[j].trim()) j++;
-      const relUrl = lines[j]?.trim();
-      if (!relUrl) continue;
-
-      streams.push({ bandwidth, resolution, url: absUrl(masterUrl, relUrl) });
+    const parts = line.replace("#EXT-X-STREAM-INF:", "").split(",");
+    let bandwidth = null;
+    let resolution = null;
+    for (const p of parts) {
+      if (p.includes("BANDWIDTH=")) bandwidth = parseInt(p.replace("BANDWIDTH=", ""));
+      if (p.includes("RESOLUTION=")) resolution = p.replace("RESOLUTION=", "");
     }
+    if (!bandwidth) continue;
+
+    const subUrl = lines[i + 1]?.trim();
+    if (!subUrl) continue;
+    streams.push({
+      bandwidth,
+      resolution,
+      url: subUrl.match(/^https?:\/\//) ? subUrl : `${baseMasterUrl}/${subUrl}`
+    });
   }
 
   if (!streams.length) return res.json({ error: "No streams found" });
 
-  // Fetch all variant playlists in parallel
-  const variantFetches = streams.map((s) => fetchText(s.url, referer));
-  const variantTxts = await Promise.all(variantFetches);
+  // 3) Create folder
+  const folderName = `${Date.now()}_${Math.floor(Math.random() * 9000 + 1000)}`;
+  const baseDir = path.join("stream", folderName);
+  fs.mkdirSync(baseDir, { recursive: true });
 
+  // 4) Process variant playlists
   const variantEntries = [];
+  for (const s of streams) {
+    const variant = await fetchText(s.url, headers);
+    if (!variant) continue;
 
-  streams.forEach((s, idx) => {
-    const txt = variantTxts[idx];
-    if (!txt) return;
+    const folder = path.dirname(s.url);
+    const proxied = variant.replace(/^(?!#)(.*)$/gm, (_, seg) => {
+      seg = seg.trim();
+      if (!seg.match(/^https?:\/\//)) seg = `${folder}/${seg}`;
+      return `/watch-Beta/stream/proxy.php?url=${encodeURIComponent(seg)}&referer=${encodeURIComponent(referer)}`;
+    });
 
-    const processed = txt
-      .split(/\r?\n/)
-      .map((line) => {
-        const t = line.trim();
-        if (!t || t.startsWith("#")) return line;
-        const abs = absUrl(s.url, t);
-        return `${PROXY_PREFIX}${encodeURIComponent(abs)}&referer=${encodeURIComponent(referer)}`;
-      })
-      .join("\n");
+    const fileName = `${s.bandwidth}.m3u8`;
+    fs.writeFileSync(path.join(baseDir, fileName), proxied, "utf-8");
 
-    const fileName = `${s.bandwidth || "v" + idx}.m3u8`;
-    const filePath = path.join(cacheDir, fileName);
-    fs.writeFileSync(filePath, processed, "utf-8");
-    variantEntries.push({ bandwidth: s.bandwidth, resolution: s.resolution, file: path.join("stream_cache", hash, fileName) });
-  });
-
-  // Build new master playlist
-  const masterLines = ["#EXTM3U", "#EXT-X-VERSION:3"];
-  variantEntries.forEach((v) => {
-    masterLines.push(`#EXT-X-STREAM-INF:BANDWIDTH=${v.bandwidth || 0}`);
-    masterLines.push(path.basename(v.file));
-  });
-
-  fs.writeFileSync(masterCachePath, masterLines.join("\n"), "utf-8");
-
-  res.json({
-    master: path.join("stream_cache", hash, "master.m3u8"),
-    all: variantEntries,
-  });
-});
-
-// --------------------- SERVE FILES FOR FRONT-END ---------------------
-app.use("/stream_cache", express.static(BASE_OUTPUT_DIR));
-
-// --------------------- SELF-CHECK ---------------------
-app.get("/self-check", (req, res) => {
-  res.json({ ok: true, time: Date.now() });
-});
-
-// Self-check interval
-setInterval(async () => {
-  try {
-    await axios.get(`http://localhost:${PORT}/self-check`, { timeout: 3000 });
-    console.log("Self-check OK:", new Date().toISOString());
-  } catch (err) {
-    console.error("SELF CHECK FAILED:", err.message);
+    variantEntries.push({
+      bandwidth: s.bandwidth,
+      resolution: s.resolution,
+      file: path.join(baseDir, fileName)
+    });
   }
-}, 30 * 1000);
 
-// --------------------- START SERVER ---------------------
+  // 5) Build master playlist
+  let masterOut = "#EXTM3U\n#EXT-X-VERSION:3\n";
+  for (const v of variantEntries) {
+    masterOut += `#EXT-X-STREAM-INF:BANDWIDTH=${v.bandwidth},RESOLUTION=${v.resolution}\n`;
+    masterOut += `${path.basename(v.file)}\n`;
+  }
+  fs.writeFileSync(path.join(baseDir, "master.m3u8"), masterOut, "utf-8");
+
+  // 6) Return JSON
+  res.json({
+    master: path.join(baseDir, "master.m3u8"),
+    all: variantEntries
+  });
+});
+
+// --- Start server ---
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
